@@ -7,18 +7,27 @@ import Event from './events';
 import {ErrorTypes, ErrorDetails} from './errors';
 import PlaylistLoader from './loader/playlist-loader';
 import FragmentLoader from './loader/fragment-loader';
-import AbrController from    './controller/abr-controller';
-import BufferController from './controller/buffer-controller';
+import KeyLoader from './loader/key-loader';
+
+import StreamController from  './controller/stream-controller';
 import LevelController from  './controller/level-controller';
-//import FPSController from './controller/fps-controller';
+
 import {logger, enableLogs} from './utils/logger';
-import XhrLoader from './utils/xhr-loader';
 import EventEmitter from 'events';
+import {hlsDefaultConfig} from './config';
 
 class Hls {
 
+  static get version() {
+    // replaced with browserify-versionify transform
+    return '__VERSION__';
+  }
+
   static isSupported() {
-    return (window.MediaSource && window.MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E,mp4a.40.2"'));
+    window.MediaSource = window.MediaSource || window.WebKitMediaSource;
+    return (window.MediaSource &&
+            typeof window.MediaSource.isTypeSupported === 'function' &&
+            window.MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E,mp4a.40.2"'));
   }
 
   static get Events() {
@@ -33,40 +42,40 @@ class Hls {
     return ErrorDetails;
   }
 
+  static get DefaultConfig() {
+    if(!Hls.defaultConfig) {
+      return hlsDefaultConfig;
+    }
+    return Hls.defaultConfig;
+  }
+
+  static set DefaultConfig(defaultConfig) {
+    Hls.defaultConfig = defaultConfig;
+  }
+
   constructor(config = {}) {
-   var configDefault = {
-      autoStartLoad: true,
-      debug: false,
-      maxBufferLength: 30,
-      maxBufferSize: 60 * 1000 * 1000,
-      liveSyncDurationCount:3,
-      liveMaxLatencyDurationCount: Infinity,
-      maxMaxBufferLength: 600,
-      enableWorker: true,
-      fragLoadingTimeOut: 20000,
-      fragLoadingMaxRetry: 1,
-      fragLoadingRetryDelay: 1000,
-      fragLoadingLoopThreshold: 3,
-      manifestLoadingTimeOut: 10000,
-      manifestLoadingMaxRetry: 1,
-      manifestLoadingRetryDelay: 1000,
-      fpsDroppedMonitoringPeriod: 5000,
-      fpsDroppedMonitoringThreshold: 0.2,
-      appendErrorMaxRetry: 200,
-      loader: XhrLoader,
-      abrController : AbrController
-    };
-    for (var prop in configDefault) {
+    var defaultConfig = Hls.DefaultConfig;
+
+    if ((config.liveSyncDurationCount || config.liveMaxLatencyDurationCount) && (config.liveSyncDuration || config.liveMaxLatencyDuration)) {
+      throw new Error('Illegal hls.js config: don\'t mix up liveSyncDurationCount/liveMaxLatencyDurationCount and liveSyncDuration/liveMaxLatencyDuration');
+    }
+
+    for (var prop in defaultConfig) {
         if (prop in config) { continue; }
-        config[prop] = configDefault[prop];
+        config[prop] = defaultConfig[prop];
     }
 
     if (config.liveMaxLatencyDurationCount !== undefined && config.liveMaxLatencyDurationCount <= config.liveSyncDurationCount) {
-      throw new Error('Illegal hls.js configuration: "liveMaxLatencyDurationCount" must be strictly superior to "liveSyncDurationCount" in player configuration');
+      throw new Error('Illegal hls.js config: "liveMaxLatencyDurationCount" must be gt "liveSyncDurationCount"');
+    }
+
+    if (config.liveMaxLatencyDuration !== undefined && (config.liveMaxLatencyDuration <= config.liveSyncDuration || config.liveSyncDuration === undefined)) {
+      throw new Error('Illegal hls.js config: "liveMaxLatencyDuration" must be gt "liveSyncDuration"');
     }
 
     enableLogs(config.debug);
     this.config = config;
+    this._autoLevelCapping = -1;
     // observer setup
     var observer = this.observer = new EventEmitter();
     observer.trigger = function trigger (event, ...data) {
@@ -79,67 +88,76 @@ class Hls {
     this.on = observer.on.bind(observer);
     this.off = observer.off.bind(observer);
     this.trigger = observer.trigger.bind(observer);
-    this.playlistLoader = new PlaylistLoader(this);
-    this.fragmentLoader = new FragmentLoader(this);
-    this.levelController = new LevelController(this);
-    this.abrController = new config.abrController(this);
-    this.bufferController = new BufferController(this);
-    //this.fpsController = new FPSController(this);
+
+    // network controllers
+    const levelController = this.levelController = new LevelController(this);
+    const streamController = this.streamController = new StreamController(this);
+    let networkControllers = [levelController, streamController];
+
+    // optional audio stream controller
+    let Controller = config.audioStreamController;
+    if (Controller) {
+      networkControllers.push(new Controller(this));
+    }
+
+    this.networkControllers = networkControllers;
+
+    // core controllers and network loaders
+    // hls.abrController is referenced in levelController, this would need to be fixed
+    const abrController = this.abrController = new config.abrController(this);
+    const bufferController  = new config.bufferController(this);
+    const capLevelController = new config.capLevelController(this);
+    const fpsController = new config.fpsController(this);
+    const playListLoader = new PlaylistLoader(this);
+    const fragmentLoader = new FragmentLoader(this);
+    const keyLoader = new KeyLoader(this);
+
+    let coreComponents = [ playListLoader, fragmentLoader, keyLoader, abrController, bufferController, capLevelController, fpsController ];
+
+    // optional audio track and subtitle controller
+    Controller = config.audioTrackController;
+    if (Controller) {
+      let audioTrackController = new Controller(this);
+      this.audioTrackController = audioTrackController;
+      coreComponents.push(audioTrackController);
+    }
+
+    Controller = config.subtitleTrackController;
+    if (Controller) {
+      let subtitleTrackController = new Controller(this);
+      this.subtitleTrackController = subtitleTrackController;
+      coreComponents.push(subtitleTrackController);
+    }
+
+    // optional subtitle controller
+    [config.subtitleStreamController, config.timelineController].forEach(Controller => {
+      if (Controller) {
+        coreComponents.push(new Controller(this));
+      }
+    });
+    this.coreComponents = coreComponents;
   }
 
   destroy() {
     logger.log('destroy');
     this.trigger(Event.DESTROYING);
-    this.playlistLoader.destroy();
-    this.fragmentLoader.destroy();
-    this.levelController.destroy();
-    this.bufferController.destroy();
-    //this.fpsController.destroy();
+    this.detachMedia();
+    this.coreComponents.concat(this.networkControllers).forEach(component => {component.destroy();});
     this.url = null;
-    this.detachVideo();
     this.observer.removeAllListeners();
+    this._autoLevelCapping = -1;
   }
 
-  attachVideo(video) {
-    logger.log('attachVideo');
-    this.video = video;
-    // setup the media source
-    var ms = this.mediaSource = new MediaSource();
-    //Media Source listeners
-    this.onmso = this.onMediaSourceOpen.bind(this);
-    this.onmse = this.onMediaSourceEnded.bind(this);
-    this.onmsc = this.onMediaSourceClose.bind(this);
-    ms.addEventListener('sourceopen', this.onmso);
-    ms.addEventListener('sourceended', this.onmse);
-    ms.addEventListener('sourceclose', this.onmsc);
-    // link video and media Source
-    video.src = URL.createObjectURL(ms);
-    video.addEventListener('error', this.onverror);
+  attachMedia(media) {
+    logger.log('attachMedia');
+    this.media = media;
+    this.trigger(Event.MEDIA_ATTACHING, {media: media});
   }
 
-  detachVideo() {
-    logger.log('detachVideo');
-    var video = this.video;
-    logger.log('trigger MSE_DETACHING');
-    this.trigger(Event.MSE_DETACHING);
-    var ms = this.mediaSource;
-    if (ms) {
-      if (ms.readyState === 'open') {
-        ms.endOfStream();
-      }
-      ms.removeEventListener('sourceopen', this.onmso);
-      ms.removeEventListener('sourceended', this.onmse);
-      ms.removeEventListener('sourceclose', this.onmsc);
-      // unlink MediaSource from video tag
-      video.src = '';
-      this.mediaSource = null;
-      logger.log('trigger MSE_DETACHED');
-      this.trigger(Event.MSE_DETACHED);
-    }
-    this.onmso = this.onmse = this.onmsc = null;
-    if (video) {
-      this.video = null;
-    }
+  detachMedia() {
+    logger.log('detachMedia');
+    this.trigger(Event.MEDIA_DETACHING);
+    this.media = null;
   }
 
   loadSource(url) {
@@ -149,16 +167,26 @@ class Hls {
     this.trigger(Event.MANIFEST_LOADING, {url: url});
   }
 
-  startLoad() {
-    logger.log('startLoad');
-    this.bufferController.startLoad();
+  startLoad(startPosition=-1) {
+    logger.log(`startLoad(${startPosition})`);
+    this.networkControllers.forEach(controller => {controller.startLoad(startPosition);});
+  }
+
+  stopLoad() {
+    logger.log('stopLoad');
+    this.networkControllers.forEach(controller => {controller.stopLoad();});
+  }
+
+  swapAudioCodec() {
+    logger.log('swapAudioCodec');
+    this.streamController.swapAudioCodec();
   }
 
   recoverMediaError() {
     logger.log('recoverMediaError');
-    var video = this.video;
-    this.detachVideo();
-    this.attachVideo(video);
+    var media = this.media;
+    this.detachMedia();
+    this.attachMedia(media);
   }
 
   /** Return all quality levels **/
@@ -168,26 +196,26 @@ class Hls {
 
   /** Return current playback quality level **/
   get currentLevel() {
-    return this.bufferController.currentLevel;
+    return this.streamController.currentLevel;
   }
 
   /* set quality level immediately (-1 for automatic level selection) */
   set currentLevel(newLevel) {
     logger.log(`set currentLevel:${newLevel}`);
     this.loadLevel = newLevel;
-    this.bufferController.immediateLevelSwitch();
+    this.streamController.immediateLevelSwitch();
   }
 
   /** Return next playback quality level (quality level of next fragment) **/
   get nextLevel() {
-    return this.bufferController.nextLevel;
+    return this.streamController.nextLevel;
   }
 
   /* set quality level for next fragment (-1 for automatic level selection) */
   set nextLevel(newLevel) {
     logger.log(`set nextLevel:${newLevel}`);
     this.levelController.manualLevel = newLevel;
-    this.bufferController.nextLevelSwitch();
+    this.streamController.nextLevelSwitch();
   }
 
   /** Return the quality level of current/last loaded fragment **/
@@ -203,18 +231,18 @@ class Hls {
 
   /** Return the quality level of next loaded fragment **/
   get nextLoadLevel() {
-    return this.levelController.nextLoadLevel();
+    return this.levelController.nextLoadLevel;
   }
 
   /** set quality level of next loaded fragment **/
   set nextLoadLevel(level) {
-    this.levelController.level = level;
+    this.levelController.nextLoadLevel = level;
   }
 
   /** Return first level (index of first level referenced in manifest)
   **/
   get firstLevel() {
-    return this.levelController.firstLevel;
+    return Math.max(this.levelController.firstLevel, this.minAutoLevel);
   }
 
   /** set first level (index of first level referenced in manifest)
@@ -238,18 +266,23 @@ class Hls {
   **/
   set startLevel(newLevel) {
     logger.log(`set startLevel:${newLevel}`);
-    this.levelController.startLevel = newLevel;
+    const hls = this;
+    // if not in automatic start level detection, ensure startLevel is greater than minAutoLevel
+    if (newLevel !== -1) {
+      newLevel = Math.max(newLevel,hls.minAutoLevel);
+    }
+    hls.levelController.startLevel = newLevel;
   }
 
   /** Return the capping/max level value that could be used by automatic level selection algorithm **/
   get autoLevelCapping() {
-    return this.abrController.autoLevelCapping;
+    return this._autoLevelCapping;
   }
 
   /** set the capping/max level value that could be used by automatic level selection algorithm **/
   set autoLevelCapping(newLevel) {
     logger.log(`set autoLevelCapping:${newLevel}`);
-    this.abrController.autoLevelCapping = newLevel;
+    this._autoLevelCapping = newLevel;
   }
 
   /* check if we are in automatic level selection mode */
@@ -262,19 +295,89 @@ class Hls {
     return this.levelController.manualLevel;
   }
 
-  onMediaSourceOpen() {
-    logger.log('media source opened');
-    this.trigger(Event.MSE_ATTACHED, {video: this.video, mediaSource: this.mediaSource});
-    // once received, don't listen anymore to sourceopen event
-    this.mediaSource.removeEventListener('sourceopen', this.onmso);
+  /* return min level selectable in auto mode according to config.minAutoBitrate */
+  get minAutoLevel() {
+    let hls = this, levels = hls.levels, minAutoBitrate = hls.config.minAutoBitrate, len = levels ? levels.length : 0;
+    for (let i = 0; i < len; i++) {
+      const levelNextBitrate = levels[i].realBitrate ? Math.max(levels[i].realBitrate,levels[i].bitrate) : levels[i].bitrate;
+      if (levelNextBitrate > minAutoBitrate) {
+        return i;
+      }
+    }
+    return 0;
   }
 
-  onMediaSourceClose() {
-    logger.log('media source closed');
+  /* return max level selectable in auto mode according to autoLevelCapping */
+  get maxAutoLevel() {
+    const hls = this;
+    const levels = hls.levels;
+    const autoLevelCapping = hls.autoLevelCapping;
+    let maxAutoLevel;
+    if (autoLevelCapping=== -1 && levels && levels.length) {
+      maxAutoLevel = levels.length - 1;
+    } else {
+      maxAutoLevel = autoLevelCapping;
+    }
+    return maxAutoLevel;
   }
 
-  onMediaSourceEnded() {
-    logger.log('media source ended');
+  // return next auto level
+  get nextAutoLevel() {
+    const hls = this;
+    // ensure next auto level is between  min and max auto level
+    return Math.min(Math.max(hls.abrController.nextAutoLevel,hls.minAutoLevel),hls.maxAutoLevel);
+  }
+
+  // this setter is used to force next auto level
+  // this is useful to force a switch down in auto mode : in case of load error on level N, hls.js can set nextAutoLevel to N-1 for example)
+  // forced value is valid for one fragment. upon succesful frag loading at forced level, this value will be resetted to -1 by ABR controller
+  set nextAutoLevel(nextLevel) {
+    const hls = this;
+    hls.abrController.nextAutoLevel = Math.max(hls.minAutoLevel,nextLevel);
+  }
+
+  /** get alternate audio tracks list from playlist **/
+  get audioTracks() {
+    const audioTrackController = this.audioTrackController;
+    return audioTrackController ? audioTrackController.audioTracks : [];
+  }
+
+  /** get index of the selected audio track (index in audio track lists) **/
+  get audioTrack() {
+    const audioTrackController = this.audioTrackController;
+    return audioTrackController ? audioTrackController.audioTrack : -1;
+  }
+
+  /** select an audio track, based on its index in audio track lists**/
+  set audioTrack(audioTrackId) {
+    const audioTrackController = this.audioTrackController;
+    if (audioTrackController) {
+      audioTrackController.audioTrack = audioTrackId;
+    }
+  }
+
+  get liveSyncPosition() {
+    return this.streamController.liveSyncPosition;
+  }
+
+  /** get alternate subtitle tracks list from playlist **/
+  get subtitleTracks() {
+    const subtitleTrackController = this.subtitleTrackController;
+    return subtitleTrackController ? subtitleTrackController.subtitleTracks : [];
+  }
+
+  /** get index of the selected subtitle track (index in subtitle track lists) **/
+  get subtitleTrack() {
+    const subtitleTrackController = this.subtitleTrackController;
+    return subtitleTrackController ? subtitleTrackController.subtitleTrack : -1;
+  }
+
+  /** select an subtitle track, based on its index in subtitle track lists**/
+  set subtitleTrack(subtitleTrackId) {
+    const subtitleTrackController = this.subtitleTrackController;
+    if (subtitleTrackController) {
+      subtitleTrackController.subtitleTrack = subtitleTrackId;
+    }
   }
 }
 
